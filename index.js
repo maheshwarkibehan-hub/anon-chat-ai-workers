@@ -191,6 +191,9 @@ class AgentClient {
 
     this.socket.on('connect', () => {
       console.log(`[Agent ${this.index + 1}] Connected (${this.persona.gender} - ${this.persona.style})`);
+      // Identify this socket as an autonomous AI agent so the server NEVER matches it with another AI agent
+      this.socket.emit('register_ai_agent', { agentId: this.persona.id });
+
       setTimeout(() => {
         this.findPartner();
       }, Math.random() * 3000 + 1000);
