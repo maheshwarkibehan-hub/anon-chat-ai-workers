@@ -6,13 +6,33 @@ const personas = require('./personas');
 const app = express();
 app.use(express.json());
 
+const fs = require('fs');
+const path = require('path');
+
+// Auto-load local .env file if available
+const envFile = path.join(__dirname, '.env');
+if (fs.existsSync(envFile)) {
+  const content = fs.readFileSync(envFile, 'utf8');
+  content.split('\n').forEach(line => {
+    const m = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+    if (m) {
+      const k = m[1];
+      let v = (m[2] || '').trim().replace(/^['"](.*)['"]$/, '$1');
+      if (!process.env[k]) process.env[k] = v;
+    }
+  });
+}
+
 const PORT = process.env.PORT || 4000;
 const MAIN_SERVER_URL = process.env.MAIN_SERVER_URL || 'http://localhost:3000';
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || '';
+const NVIDIA_MODEL = process.env.NVIDIA_MODEL || 'mistralai/mistral-nemotron';
+
 console.log(`[AI Worker] Target Main Server: ${MAIN_SERVER_URL}`);
-console.log(`[AI Worker] Using Groq Model: ${GROQ_MODEL}`);
+console.log(`[AI Worker] Dual Engine Active: Groq (${GROQ_MODEL}) + NVIDIA (${NVIDIA_MODEL})`);
 
 // --- SEMANTIC TURN-COMPLETION EVALUATOR ---
 // Determines if user's last message is an INCOMPLETE fragment or a COMPLETE turn
@@ -93,8 +113,27 @@ function cleanTeenText(text) {
   return cleaned;
 }
 
+// Helper: Strip internal Chain-of-Thought / reasoning traces if present
+function stripThinkingTrace(text) {
+  if (!text) return '';
+  let str = text;
+  str = str.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  str = str.replace(/\[think\][\s\S]*?\[\/think\]/gi, '');
+  str = str.replace(/here's a thinking process:[\s\S]*?(?=\n\n|$)/gi, '');
+  str = str.replace(/^(\*|\-|\d+\.).*$/gm, '');
+  const lines = str.split('\n').filter(l => {
+    const low = l.toLowerCase().trim();
+    if (low.startsWith('we need to') || low.startsWith('the user is') || low.startsWith('i need to respond') || low.startsWith('constraints:')) {
+      return false;
+    }
+    return true;
+  });
+  return lines.join(' ').trim();
+}
+
 // Groq API Caller
 async function callGroqChat(systemPrompt, conversationHistory) {
+  if (!GROQ_API_KEY) return null;
   return new Promise((resolve) => {
     const payload = JSON.stringify({
       model: GROQ_MODEL,
@@ -124,29 +163,124 @@ async function callGroqChat(systemPrompt, conversationHistory) {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
       res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          let raw = parsed?.choices?.[0]?.message?.content?.trim();
-          resolve(cleanTeenText(raw || 'ha bolo'));
-        } catch (e) {
-          resolve('hnn bol na');
+        if (res.statusCode === 200) {
+          try {
+            const parsed = JSON.parse(data);
+            let raw = parsed?.choices?.[0]?.message?.content?.trim();
+            if (raw) return resolve(cleanTeenText(stripThinkingTrace(raw)));
+          } catch (e) {}
+        } else {
+          console.warn(`[Groq Warning] Status ${res.statusCode}: ${data.slice(0, 100)}`);
         }
+        resolve(null);
       });
     });
 
     req.on('timeout', () => {
       req.destroy();
-      resolve('hnn sun rhi hu');
+      console.warn('[Groq Timeout] Request timed out');
+      resolve(null);
     });
 
     req.on('error', (err) => {
       console.error('[Groq Error]', err.message);
-      resolve('ha bolo');
+      resolve(null);
     });
 
     req.write(payload);
     req.end();
   });
+}
+
+// NVIDIA NIM API Caller (Nemotron)
+async function callNvidiaChat(systemPrompt, conversationHistory) {
+  if (!NVIDIA_API_KEY) return null;
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({
+      model: NVIDIA_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...conversationHistory
+      ],
+      max_tokens: 60,
+      temperature: 0.85
+    });
+
+    const options = {
+      hostname: 'integrate.api.nvidia.com',
+      path: '/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${NVIDIA_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      },
+      timeout: 6000
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try {
+            const parsed = JSON.parse(data);
+            let raw = parsed?.choices?.[0]?.message?.content?.trim();
+            if (raw) return resolve(cleanTeenText(stripThinkingTrace(raw)));
+          } catch (e) {}
+        } else {
+          console.warn(`[NVIDIA Warning] Status ${res.statusCode}: ${data.slice(0, 100)}`);
+        }
+        resolve(null);
+      });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      console.warn('[NVIDIA Timeout] Request timed out');
+      resolve(null);
+    });
+
+    req.on('error', (err) => {
+      console.error('[NVIDIA Error]', err.message);
+      resolve(null);
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+// Dual Engine Dispatcher: Load balance across Groq & NVIDIA with auto-failover
+async function generateDualEngineReply(agentIndex, systemPrompt, conversationHistory) {
+  const useGroqFirst = (agentIndex % 2 === 0);
+  const primaryName = useGroqFirst ? 'Groq' : 'NVIDIA Nemotron';
+  const backupName = useGroqFirst ? 'NVIDIA Nemotron' : 'Groq';
+
+  // 1. Try Primary Provider
+  let reply = useGroqFirst 
+    ? await callGroqChat(systemPrompt, conversationHistory)
+    : await callNvidiaChat(systemPrompt, conversationHistory);
+
+  if (reply) {
+    console.log(`[Dual Engine] Agent ${agentIndex + 1} reply served by ${primaryName}`);
+    return reply;
+  }
+
+  // 2. Failover to Backup Provider
+  console.log(`[Dual Engine Failover] ${primaryName} failed. Switching to ${backupName}...`);
+  reply = useGroqFirst
+    ? await callNvidiaChat(systemPrompt, conversationHistory)
+    : await callGroqChat(systemPrompt, conversationHistory);
+
+  if (reply) {
+    console.log(`[Dual Engine] Agent ${agentIndex + 1} reply served by ${backupName} (Backup)`);
+    return reply;
+  }
+
+  // 3. Realistic fallbacks if both providers are busy
+  const fallbacks = ['ha bol na', 'hnn sun rhi hu', 'kya hua', 'bol na yr'];
+  return fallbacks[Math.floor(Math.random() * fallbacks.length)];
 }
 
 const memoryStore = require('./memory-store');
@@ -350,7 +484,7 @@ class AgentClient {
         }
       }
 
-      const reply = await callGroqChat(systemPrompt, this.history);
+      const reply = await generateDualEngineReply(this.index, systemPrompt, this.history);
       const typingDelay = calculateTypingDelay(reply);
 
       // Record conversation turn into persistent long-term memory
