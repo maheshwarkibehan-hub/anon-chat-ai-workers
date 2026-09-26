@@ -1,0 +1,13 @@
+{
+  "name": "anon-chat-ai-workers",
+  "version": "1.0.0",
+  "description": "Ultra-realistic 10 AI Agents Worker Service for Anon-Chat on Render",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io-client": "^4.7.5"
+  }
+}
