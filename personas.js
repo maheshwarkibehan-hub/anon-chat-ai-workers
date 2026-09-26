@@ -112,14 +112,35 @@ teases boys about late night chatting.`
   }
 ];
 
-// Dynamically construct system prompt by embedding fresh dialogues from GitHub
+const datasetBank = require('./teen-dialogue-dataset');
+
+// Dynamically construct system prompt by embedding curated dataset bank + fresh GitHub dialogues
 function getDynamicSystemPrompt(persona) {
+  const isGirl = persona.gender === 'female';
+  
+  // Pick curated persona-relevant examples from dataset bank
+  let curatedList = [];
+  if (isGirl) {
+    curatedList = [...datasetBank.flirtyBanter.slice(0, 4), ...datasetBank.schoolDrama.slice(0, 2), ...datasetBank.antiBotDefense.slice(0, 2)];
+  } else {
+    curatedList = [...datasetBank.backbencher.slice(0, 3), ...datasetBank.lazyVibe.slice(0, 3), ...datasetBank.schoolDrama.slice(0, 2)];
+  }
+
+  const curatedExamplesText = curatedList
+    .map(pair => `User: "${pair.u}" -> "${pair.a}"`)
+    .join('\n');
+
+  // Fresh live dialogues synced directly from GitHub /chat/ folder
   const liveExamples = autoLearner.getDynamicExamplesText();
+
   return `${persona.basePrompt}
 ${TEEN_GROUND_RULES}
 
-LATEST REAL DIALOGUES SYNCED FROM APP'S RECENT CHATS (Mimic this exact rhythm & slang):
-${liveExamples}
+AUTHENTIC INDIAN TEEN DIALOGUE EXAMPLES (Mimic this exact active, teasing rhythm):
+${curatedExamplesText}
+
+LIVE FRESH CHATS FROM GITHUB (Stay up-to-date with current app trends):
+${liveExamples || 'User: "kll school aaogi" -> "nhi yr test h padhaai k bahane bunk marungi"'}
 `;
 }
 
