@@ -77,15 +77,7 @@ class MemoryStore {
     if (lower.includes('bio') || lower.includes('physics')) mem.knownFacts.push('studied science');
 
     // Deduplicate facts
-    mem.knownFacts = [...new Set(mem.knownFacts)].slice(-6);
-
-    // Track keywords for topics
-    const words = lower.split(/\s+/).filter(w => w.length > 4);
-    if (words.length > 0) {
-      mem.topicsDiscussed.push(words.slice(0, 3).join(' '));
-      mem.topicsDiscussed = [...new Set(mem.topicsDiscussed)].slice(-5);
-    }
-
+    mem.knownFacts = [...new Set(mem.knownFacts)].slice(-5);
     this.saveMemory();
   }
 
@@ -102,7 +94,6 @@ class MemoryStore {
         lastSeen: new Date().toISOString(),
         totalChats: 1,
         knownFacts: [],
-        topicsDiscussed: [],
         lastVibe: 'friendly'
       };
       this.memories.set(partnerHash, mem);
@@ -115,16 +106,7 @@ class MemoryStore {
     const mem = this.getUserMemory(partnerHash);
     if (!mem || mem.totalChats <= 1) return '';
 
-    let prompt = `\nLONG-TERM MEMORY OF THIS USER (You have talked to this student before!):\n`;
-    prompt += `- You have chatted with them ${mem.totalChats} times before.\n`;
-    if (mem.knownFacts.length > 0) {
-      prompt += `- Things you remember about them: ${mem.knownFacts.join(', ')}.\n`;
-    }
-    if (mem.topicsDiscussed.length > 0) {
-      prompt += `- Past topics discussed: ${mem.topicsDiscussed.join(', ')}.\n`;
-    }
-    prompt += `- BEHAVIOR: Act pleasantly surprised or tease them about talking again ("areyy tum firse mil gaye lol", "pehle bhi baat hui thi na hamari? 😉"). Never recite this like a robot; bring it up naturally like an old friend!\n`;
-
+    let prompt = `\n[NOTE: You have chatted with this anonymous stranger ${mem.totalChats} times before on this app. Be warm and friendly, but do not recite details unnaturally.]\n`;
     return prompt;
   }
 }
