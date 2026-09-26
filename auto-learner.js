@@ -63,11 +63,14 @@ async function syncWithGitHubChatFolder() {
         const chatData = await fetchJson(rawUrl);
         if (chatData && Array.isArray(chatData.messages) && chatData.messages.length >= 2) {
           const msgs = chatData.messages;
+          const deadReplies = ['thk', 'k', 'ok', 'ghanta', 'hhmmmm', 'hmm', 'bye', 'thk bye', 'babu', 'good night', 'good nahigt', 'bass', 'kch ni'];
           for (let i = 0; i < msgs.length - 1; i++) {
             if (msgs[i].sender !== msgs[i+1].sender && msgs[i].text && msgs[i+1].text) {
               const uText = msgs[i].text.trim().toLowerCase().replace(/[\.\,]+/g, '');
               const aText = msgs[i+1].text.trim().toLowerCase().replace(/[\.\,]+/g, '');
-              if (uText.length > 1 && aText.length > 1 && uText.length < 50 && aText.length < 50) {
+              // Only pick engaging, multi-word dialogues (at least 3 words, not dead repetitive one-words)
+              const wordCount = aText.split(/\s+/).length;
+              if (uText.length > 2 && aText.length > 5 && wordCount >= 3 && !deadReplies.includes(aText)) {
                 extractedPairs.push(`User: "${uText}" -> "${aText}"`);
               }
             }

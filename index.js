@@ -102,8 +102,10 @@ async function callGroqChat(systemPrompt, conversationHistory) {
         { role: 'system', content: systemPrompt },
         ...conversationHistory
       ],
-      max_tokens: 50,
-      temperature: 0.82
+      max_tokens: 75,
+      temperature: 0.88,
+      presence_penalty: 0.65,
+      frequency_penalty: 0.55
     });
 
     const options = {
