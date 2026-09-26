@@ -319,9 +319,11 @@ class AgentClient {
     this.sendTimeout = null;
     this.autoLeaveTimeout = null;
     this.currentActionId = 0;
+    this.isConnected = false;
   }
 
   connect() {
+    if (this.socket) return;
     this.socket = io(MAIN_SERVER_URL, {
       transports: ['websocket', 'polling'],
       reconnection: true,
@@ -329,13 +331,14 @@ class AgentClient {
     });
 
     this.socket.on('connect', () => {
+      this.isConnected = true;
       console.log(`[Agent ${this.index + 1}] Connected (${this.persona.gender} - ${this.persona.style})`);
       // Identify this socket as an autonomous AI agent so the server NEVER matches it with another AI agent
       this.socket.emit('register_ai_agent', { agentId: this.persona.id });
 
       setTimeout(() => {
-        this.findPartner();
-      }, Math.random() * 3000 + 1000);
+        if (this.isConnected && !this.inRoom) this.findPartner();
+      }, Math.random() * 2500 + 1000);
     });
 
     this.socket.on('waiting_for_partner', () => {
@@ -440,15 +443,14 @@ class AgentClient {
     });
 
     this.socket.on('partner_disconnected', () => {
-      console.log(`[Agent ${this.index + 1}] Partner left. Re-queuing...`);
+      console.log(`[Agent ${this.index + 1}] Partner left.`);
       this.inRoom = false;
       this.clearTimeouts();
-      setTimeout(() => {
-        this.findPartner();
-      }, Math.random() * 4000 + 3000);
+      handleAgentPostChat(this);
     });
 
     this.socket.on('disconnect', () => {
+      this.isConnected = false;
       this.inRoom = false;
       this.clearTimeouts();
     });
@@ -550,6 +552,19 @@ class AgentClient {
     }
   }
 
+  disconnectAgent() {
+    this.clearTimeouts();
+    this.inRoom = false;
+    this.isConnected = false;
+    if (this.socket) {
+      try {
+        this.socket.disconnect();
+      } catch(e) {}
+      this.socket = null;
+      console.log(`[Agent ${this.index + 1}] Went offline (taking a break)`);
+    }
+  }
+
   resetAutoLeave() {
     if (this.autoLeaveTimeout) clearTimeout(this.autoLeaveTimeout);
     this.autoLeaveTimeout = setTimeout(() => {
@@ -573,42 +588,153 @@ class AgentClient {
   }
 }
 
+// ---------------------------------------------------------------------
+// DYNAMIC ROTATING AGENT POOL (2 to 4 agents online simultaneously)
+// The remaining personas stay offline/resting to simulate genuine school life.
+// ---------------------------------------------------------------------
+const TARGET_MIN_ONLINE = 2;
+const TARGET_MAX_ONLINE = 4;
 const activeAgents = [];
 let initialized = false;
+
+function getOnlineAgents() {
+  return activeAgents.filter(a => a.isConnected);
+}
+
+function getIdleOnlineAgents() {
+  return activeAgents.filter(a => a.isConnected && !a.inRoom);
+}
+
+function getOfflineAgents() {
+  return activeAgents.filter(a => !a.isConnected);
+}
+
+function bringNextAgentOnline() {
+  const offline = getOfflineAgents();
+  if (offline.length === 0) return null;
+  const chosen = offline[Math.floor(Math.random() * offline.length)];
+  chosen.connect();
+  return chosen;
+}
+
+function handleAgentPostChat(agent) {
+  // After finishing a chat with a human:
+  // Take a natural break (45s - 90s), then either re-queue or swap with another offline student
+  setTimeout(() => {
+    if (agent.inRoom) return;
+
+    const online = getOnlineAgents();
+    if (online.length > TARGET_MIN_ONLINE && Math.random() < 0.6) {
+      // Rotate out: disconnect this agent and summon another offline persona
+      agent.disconnectAgent();
+      setTimeout(() => {
+        const currentOnline = getOnlineAgents();
+        if (currentOnline.length < TARGET_MAX_ONLINE) {
+          bringNextAgentOnline();
+        }
+      }, Math.random() * 5000 + 2000);
+    } else {
+      // Re-enter matchmaking queue
+      agent.findPartner();
+    }
+  }, Math.random() * 45000 + 30000);
+}
+
+// Pool maintainer: runs every 60 seconds to ensure 2-4 agents are available
+function maintainAgentPool() {
+  const online = getOnlineAgents();
+  if (online.length < TARGET_MIN_ONLINE) {
+    const diff = TARGET_MIN_ONLINE - online.length;
+    for (let i = 0; i < diff; i++) {
+      bringNextAgentOnline();
+    }
+  } else if (online.length > TARGET_MAX_ONLINE) {
+    const idle = getIdleOnlineAgents();
+    if (idle.length > 0) {
+      idle[0].disconnectAgent();
+    }
+  }
+}
+
+setInterval(maintainAgentPool, 60000);
 
 function startAgents() {
   if (initialized) return;
   initialized = true;
-  console.log(`[AI Worker] Spawning 10 School Student AI Agents (15-16yo)...`);
+  console.log(`[AI Worker] Initializing 10 School Student AI Personas with Dynamic Rotation...`);
   personas.forEach((persona, idx) => {
     const agent = new AgentClient(persona, idx);
     activeAgents.push(agent);
+  });
+
+  // Start with 3 active agents initially
+  const initialIndices = [0, 1, 2];
+  initialIndices.forEach((idx, delayIdx) => {
     setTimeout(() => {
-      agent.connect();
-    }, idx * 600);
+      activeAgents[idx].connect();
+    }, delayIdx * 1200);
   });
 }
 
-app.get('/health', (req, res) => {
+// Root endpoint for Render health and uptime monitors
+app.get('/', (req, res) => {
   res.json({
+    service: 'anon-chat-ai-workers',
     status: 'online',
-    agentsCount: activeAgents.length,
+    onlineAgents: getOnlineAgents().length,
     activeRooms: activeAgents.filter(a => a.inRoom).length,
     timestamp: Date.now()
   });
 });
 
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    totalPersonas: activeAgents.length,
+    onlineAgents: getOnlineAgents().length,
+    activeRooms: activeAgents.filter(a => a.inRoom).length,
+    timestamp: Date.now()
+  });
+});
+
+// Auto-wakeup endpoint called by main server on visitor arrival
 app.post('/api/wakeup', (req, res) => {
   console.log('[AI Worker] Wakeup ping received from main server!');
   if (!initialized) {
     startAgents();
   } else {
-    activeAgents.forEach(a => {
-      if (!a.inRoom) a.findPartner();
-    });
+    // If no idle agent is currently queued, wake one up immediately!
+    const idle = getIdleOnlineAgents();
+    if (idle.length > 0) {
+      idle.forEach(a => a.findPartner());
+    } else {
+      const newAgent = bringNextAgentOnline();
+      if (newAgent) {
+        console.log(`[AI Worker] Instant summoned Agent ${newAgent.index + 1} for waiting human!`);
+      }
+    }
   }
-  res.json({ status: 'awake', activeAgents: activeAgents.length });
+  res.json({
+    status: 'awake',
+    totalPersonas: activeAgents.length,
+    onlineAgents: getOnlineAgents().length,
+    activeRooms: activeAgents.filter(a => a.inRoom).length
+  });
 });
+
+// Mutual Keep-Alive Heartbeat: pings main server every 9 mins if deployed on Render
+setInterval(() => {
+  if (MAIN_SERVER_URL && (MAIN_SERVER_URL.startsWith('http://') || MAIN_SERVER_URL.startsWith('https://')) && !MAIN_SERVER_URL.includes('localhost')) {
+    try {
+      const isHttps = MAIN_SERVER_URL.startsWith('https');
+      const client = isHttps ? require('https') : require('http');
+      const pingUrl = new URL('/api/version', MAIN_SERVER_URL);
+      client.get(pingUrl, (res) => {
+        res.resume();
+      }).on('error', () => {});
+    } catch(e) {}
+  }
+}, 9 * 60 * 1000);
 
 startAgents();
 
