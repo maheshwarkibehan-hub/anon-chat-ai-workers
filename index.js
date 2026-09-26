@@ -86,10 +86,10 @@ function evaluateTurnStatus(text) {
 
 // Clean and enforce 15-16yo texting rules
 function cleanTeenText(text) {
-  if (!text) return 'ha bol';
+  if (!text) return 'ha bol na';
   let cleaned = text.trim()
     .toLowerCase()
-    .replace(/[\.\,\;\:\!]+/g, ' ')   // Eliminate periods, commas, semicolons
+    .replace(/[!?,;:]+|(?<!\d)\.|\.(?!\d)/g, ' ')   // Eliminate punctuation, but PRESERVE decimal numbers (e.g. 3.14)
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -104,13 +104,13 @@ function cleanTeenText(text) {
     });
   }
 
-  // Word cap: Max 18 words
+  // Word cap: Only trim if truly runaway (over 28 words) to prevent cutting sentences in half
   const words = cleaned.split(' ');
-  if (words.length > 18) {
-    cleaned = words.slice(0, 16).join(' ');
+  if (words.length > 28) {
+    cleaned = words.slice(0, 24).join(' ');
   }
 
-  return cleaned;
+  return cleaned || 'ha bol na';
 }
 
 // Helper: Strip internal Chain-of-Thought / reasoning traces if present
@@ -120,7 +120,7 @@ function stripThinkingTrace(text) {
   str = str.replace(/<think>[\s\S]*?<\/think>/gi, '');
   str = str.replace(/\[think\][\s\S]*?\[\/think\]/gi, '');
   str = str.replace(/here's a thinking process:[\s\S]*?(?=\n\n|$)/gi, '');
-  str = str.replace(/^(\*|\-|\d+\.).*$/gm, '');
+  // Do NOT strip ^\d+\. because that deletes math/GK answers like 3.14
   const lines = str.split('\n').filter(l => {
     const low = l.toLowerCase().trim();
     if (low.startsWith('we need to') || low.startsWith('the user is') || low.startsWith('i need to respond') || low.startsWith('constraints:')) {
@@ -141,7 +141,7 @@ async function callGroqChat(systemPrompt, conversationHistory) {
         { role: 'system', content: systemPrompt },
         ...conversationHistory
       ],
-      max_tokens: 75,
+      max_tokens: 110,
       temperature: 0.88,
       presence_penalty: 0.65,
       frequency_penalty: 0.55
@@ -202,7 +202,7 @@ async function callNvidiaChat(systemPrompt, conversationHistory) {
         { role: 'system', content: systemPrompt },
         ...conversationHistory
       ],
-      max_tokens: 60,
+      max_tokens: 110,
       temperature: 0.85
     });
 
@@ -314,8 +314,11 @@ class AgentClient {
     this.partnerTypingTimeout = null;
     this.lastMessageTime = 0;
 
+    this.greetingTimeout = null;
+    this.readingTimeout = null;
     this.sendTimeout = null;
     this.autoLeaveTimeout = null;
+    this.currentActionId = 0;
   }
 
   connect() {
@@ -346,6 +349,7 @@ class AgentClient {
       this.partnerHash = data.partnerHash || null;
       this.history = [];
       this.messageBuffer = [];
+      this.currentActionId++;
       console.log(`[Agent ${this.index + 1}] Matched in room ${data.roomId} with partner ${this.partnerHash || 'anon'}`);
 
       if (this.partnerHash) {
@@ -358,9 +362,10 @@ class AgentClient {
         console.log(`[Agent ${this.index + 1}] Recognized returning user! Total chats: ${pastMem.totalChats}`);
       }
 
-      // 40% chance the agent sends greeting first
+      // 40% chance the agent sends greeting first if user does not speak
       if (Math.random() > 0.6) {
-        setTimeout(() => {
+        if (this.greetingTimeout) clearTimeout(this.greetingTimeout);
+        this.greetingTimeout = setTimeout(() => {
           if (this.inRoom && this.history.length === 0 && this.messageBuffer.length === 0) {
             const greetings = this.persona.gender === 'female' 
               ? ['hey', 'hii', 'suno', 'koi h', 'hi'] 
@@ -395,6 +400,22 @@ class AgentClient {
     this.socket.on('receive_message', (data) => {
       if (!this.inRoom || !data || !data.text) return;
       this.resetAutoLeave();
+
+      // Cancel greeting or pending outdated response so replies never collide
+      if (this.greetingTimeout) {
+        clearTimeout(this.greetingTimeout);
+        this.greetingTimeout = null;
+      }
+      if (this.readingTimeout) {
+        clearTimeout(this.readingTimeout);
+        this.readingTimeout = null;
+      }
+      if (this.sendTimeout) {
+        clearTimeout(this.sendTimeout);
+        this.sendTimeout = null;
+        this.socket.emit('stop_typing');
+      }
+      this.currentActionId++; // Invalidate any in-flight outdated generation
 
       const userText = data.text.trim();
       this.lastMessageTime = Date.now();
@@ -467,10 +488,12 @@ class AgentClient {
     this.history.push({ role: 'user', content: combinedMessage });
     if (this.history.length > 8) this.history.shift();
 
-    const readingDelay = Math.floor(Math.random() * 1000) + 1000;
+    const actionId = ++this.currentActionId;
+    const readingDelay = Math.floor(Math.random() * 800) + 700; // 0.7s - 1.5s human reading pause
 
-    setTimeout(async () => {
-      if (!this.inRoom) return;
+    if (this.readingTimeout) clearTimeout(this.readingTimeout);
+    this.readingTimeout = setTimeout(async () => {
+      if (!this.inRoom || this.currentActionId !== actionId) return;
 
       let systemPrompt = typeof this.persona.getSystemPrompt === 'function' 
         ? this.persona.getSystemPrompt() 
@@ -485,6 +508,8 @@ class AgentClient {
       }
 
       const reply = await generateDualEngineReply(this.index, systemPrompt, this.history);
+      if (!this.inRoom || this.currentActionId !== actionId || !reply) return;
+
       const typingDelay = calculateTypingDelay(reply);
 
       // Record conversation turn into persistent long-term memory
@@ -494,41 +519,19 @@ class AgentClient {
 
       this.socket.emit('typing');
 
+      if (this.sendTimeout) clearTimeout(this.sendTimeout);
       this.sendTimeout = setTimeout(() => {
-        if (!this.inRoom) return;
+        if (!this.inRoom || this.currentActionId !== actionId) return;
         this.socket.emit('stop_typing');
-
-        // 40% chance to split multi-clause reply into 2 mini bubbles
-        const words = reply.split(' ');
-        if (words.length >= 8 && Math.random() < 0.4) {
-          const mid = Math.floor(words.length / 2);
-          const bubble1 = words.slice(0, mid).join(' ');
-          const bubble2 = words.slice(mid).join(' ');
-
-          this.sendAgentMessage(bubble1);
-
-          setTimeout(() => {
-            if (this.inRoom) {
-              this.socket.emit('typing');
-              setTimeout(() => {
-                if (this.inRoom) {
-                  this.socket.emit('stop_typing');
-                  this.sendAgentMessage(bubble2);
-                }
-              }, 1200);
-            }
-          }, 600);
-        } else {
-          this.sendAgentMessage(reply);
-        }
-
+        // Send single complete, coherent message bubble (never chopped arbitrarily in half)
+        this.sendAgentMessage(reply);
       }, typingDelay);
 
     }, readingDelay);
   }
 
   sendAgentMessage(text) {
-    if (!this.inRoom || !this.socket) return;
+    if (!this.inRoom || !this.socket || !text) return;
     const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     this.history.push({ role: 'assistant', content: text });
     if (this.history.length > 8) this.history.shift();
@@ -559,8 +562,11 @@ class AgentClient {
   }
 
   clearTimeouts() {
+    this.currentActionId++;
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.partnerTypingTimeout) clearTimeout(this.partnerTypingTimeout);
+    if (this.readingTimeout) clearTimeout(this.readingTimeout);
+    if (this.greetingTimeout) clearTimeout(this.greetingTimeout);
     if (this.sendTimeout) clearTimeout(this.sendTimeout);
     if (this.autoLeaveTimeout) clearTimeout(this.autoLeaveTimeout);
     this.messageBuffer = [];
